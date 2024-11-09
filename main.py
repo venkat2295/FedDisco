@@ -12,12 +12,15 @@ from algorithms import *
 from utils.model import *
 from utils.utils import *
 
-
 if __name__ == '__main__':
     # Configurations
     args = get_args()
+
+    # Create necessary directories
     mkdirs(args.logdir)
     mkdirs(args.modeldir)
+    mkdirs(args.datadir)
+
     now_time = datetime.datetime.now().strftime("%Y-%m-%d-%H%M-%S")
     print(now_time)
 
@@ -40,20 +43,33 @@ if __name__ == '__main__':
         format='%(asctime)s %(levelname)-8s %(message)s',
         datefmt='%m-%d %H:%M', level=logging.INFO, filemode='w')
     logger = logging.getLogger()
-    device = torch.device(args.device)
+
+    # Modified device setup
+    use_cuda = torch.cuda.is_available() and args.device.startswith('cuda')
+    device = torch.device('cuda' if use_cuda else 'cpu')
+
+    if use_cuda:
+        logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
+    else:
+        logger.info("Using CPU")
+
     seed = args.init_seed
     logger.info("#" * 100)
 
+    # Set random seeds
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
+    if use_cuda:
         torch.cuda.manual_seed(seed)
     random.seed(seed)
+
+    # Convert download_data to boolean for dataset loading
+    args.download = bool(args.download_data)
 
     # Data partition of clients
     print("Training set partition")
     net_dataidx_map, traindata_cls_counts = partition_data(args)
-    
+
     # Choose clients per round
     n_party_per_round = int(args.n_parties * args.sample_fraction)
     party_list = [i for i in range(args.n_parties)]
@@ -78,17 +94,19 @@ if __name__ == '__main__':
     global_dist = np.ones(traindata_cls_counts.shape[1])/traindata_cls_counts.shape[1] if args.test_imb == 0 else imbalanced_test_dist
     print("Length of testing set:", len(test_dl.dataset))
 
-    # Local models initialization
-    nets = init_nets(args.n_parties, args, device='cpu')
-    global_models = init_nets(1, args, device='cpu')
+    # Modified model initialization to handle device properly
+    nets = init_nets(args.n_parties, args, device=device)
+    global_models = init_nets(1, args, device=device)
     global_model = global_models[0]
+
     n_comm_rounds = args.comm_round
     if args.load_model_file:
-        global_model.load_state_dict(torch.load(args.load_model_file))
+        state_dict = torch.load(args.load_model_file, map_location=device)
+        global_model.load_state_dict(state_dict)
         n_comm_rounds -= args.load_model_round
 
     # Get the training dataloaders
-    train_local_dls=[]
+    train_local_dls = []
     for net_id, net in nets.items():
         dataidxs = net_dataidx_map[net_id]
         train_dl_local, _ = get_dataloader(args, dataidxs)
@@ -106,31 +124,36 @@ if __name__ == '__main__':
         os.mkdir(acc_dir)
     acc_path = os.path.join(dataset_logdir, f'acc_list/{now_time}.npy')
 
-    # Training
+    # Training with proper error handling
     print("\nTraining begins!")
-    if args.alg == 'moon':
-        print("----MOON----\n")
-        record_test_acc_list, best_test_acc = moon_alg(args, n_comm_rounds, nets, global_model, party_list_rounds, net_dataidx_map, train_local_dls, test_dl, traindata_cls_counts, device, global_dist, logger)
-    elif args.alg == 'fedavg':
-        print("----FEDAVG----\n")
-        record_test_acc_list , best_test_acc = fedavg_alg(args, n_comm_rounds, nets, global_model, party_list_rounds, net_dataidx_map, train_local_dls, test_dl, traindata_cls_counts, moment_v, device, global_dist, logger)   
-    elif args.alg == 'scaffold':
-        print("----SCAFFOLD----\n")
-        record_test_acc_list, best_test_acc = scaffold_alg(args, nets, global_model, party_list_rounds, net_dataidx_map, train_local_dls, test_dl, traindata_cls_counts, device, global_dist, logger)
-    elif args.alg == 'feddyn':
-        print("----FEDDYN----\n")
-        record_test_acc_list, best_test_acc = feddyn_alg(args, n_comm_rounds, global_model, party_list_rounds, net_dataidx_map, train_local_dls, test_dl, traindata_cls_counts, device, global_dist, logger)
-    elif args.alg == 'feddc':
-        print("----FEDDC----")
-        record_test_acc_list, best_test_acc = feddc_alg(args, n_comm_rounds, global_model, party_list_rounds, net_dataidx_map, train_local_dls, test_dl, traindata_cls_counts, device, global_dist, logger)
-    elif args.alg == 'fednova':
-        print("---FEDNOVA---")
-        record_test_acc_list, best_test_acc = fednova_alg(args, n_comm_rounds, nets, global_model, party_list_rounds, net_dataidx_map, train_local_dls, test_dl, traindata_cls_counts, device, global_dist, logger)
-    elif args.alg == 'fedprox':
-        print("---FEDPROX---\n")
-        record_test_acc_list, best_test_acc = fedprox_alg(args, n_comm_rounds, nets, global_model, party_list_rounds, net_dataidx_map, train_local_dls, test_dl, traindata_cls_counts, moment_v, device, global_dist, logger)
+    try:
+        if args.alg == 'moon':
+            print("----MOON----\n")
+            record_test_acc_list, best_test_acc = moon_alg(args, n_comm_rounds, nets, global_model, party_list_rounds, net_dataidx_map, train_local_dls, test_dl, traindata_cls_counts, device, global_dist, logger)
+        elif args.alg == 'fedavg':
+            print("----FEDAVG----\n")
+            record_test_acc_list, best_test_acc = fedavg_alg(args, n_comm_rounds, nets, global_model, party_list_rounds, net_dataidx_map, train_local_dls, test_dl, traindata_cls_counts, moment_v, device, global_dist, logger)
+        elif args.alg == 'scaffold':
+            print("----SCAFFOLD----\n")
+            record_test_acc_list, best_test_acc = scaffold_alg(args, nets, global_model, party_list_rounds, net_dataidx_map, train_local_dls, test_dl, traindata_cls_counts, device, global_dist, logger)
+        elif args.alg == 'feddyn':
+            print("----FEDDYN----\n")
+            record_test_acc_list, best_test_acc = feddyn_alg(args, n_comm_rounds, global_model, party_list_rounds, net_dataidx_map, train_local_dls, test_dl, traindata_cls_counts, device, global_dist, logger)
+        elif args.alg == 'feddc':
+            print("----FEDDC----")
+            record_test_acc_list, best_test_acc = feddc_alg(args, n_comm_rounds, global_model, party_list_rounds, net_dataidx_map, train_local_dls, test_dl, traindata_cls_counts, device, global_dist, logger)
+        elif args.alg == 'fednova':
+            print("---FEDNOVA---")
+            record_test_acc_list, best_test_acc = fednova_alg(args, n_comm_rounds, nets, global_model, party_list_rounds, net_dataidx_map, train_local_dls, test_dl, traindata_cls_counts, device, global_dist, logger)
+        elif args.alg == 'fedprox':
+            print("---FEDPROX---\n")
+            record_test_acc_list, best_test_acc = fedprox_alg(args, n_comm_rounds, nets, global_model, party_list_rounds, net_dataidx_map, train_local_dls, test_dl, traindata_cls_counts, moment_v, device, global_dist, logger)
+    except Exception as e:
+        logger.error(f"Training failed with error: {str(e)}")
+        raise
 
     np.save(acc_path, np.array(record_test_acc_list))
     print('>> Global Model Best accuracy: %f' % best_test_acc)
     print(args)
     print(now_time)
+    print('>> Done!')

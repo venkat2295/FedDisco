@@ -4,41 +4,57 @@ import torch.nn as nn
 import torch.optim as optim
 from utils.utils import compute_accuracy
 
+import torch.optim as optim
 
-def train_net(net_id, net, train_dataloader, test_dataloader, epochs, lr, args_optimizer, args, device="cpu", logger=None):
-    net.cuda()
+def train_net(net_id, net, train_dataloader, test_dataloader, n_epoch, lr, args_optimizer, args, device="cpu", logger=None):
     logger.info('Training network %s' % str(net_id))
+    net.to(device)
+
+    lr = 0.001
 
     if args_optimizer == 'adam':
         optimizer = optim.Adam(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, weight_decay=args.reg)
     elif args_optimizer == 'amsgrad':
-        optimizer = optim.Adam(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, weight_decay=args.reg,
-                               amsgrad=True)
+        optimizer = optim.Adam(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, weight_decay=args.reg, amsgrad=True)
     elif args_optimizer == 'sgd':
-        optimizer = optim.SGD(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, momentum=0.9,
-                              weight_decay=args.reg)
+        optimizer = optim.SGD(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, momentum=0.9, weight_decay=args.reg)
 
-    criterion = nn.CrossEntropyLoss().cuda()
-    for epoch in range(epochs): 
-        epoch_loss_collector = []    
+    criterion = nn.CrossEntropyLoss().to(device)
+
+    for epoch in range(n_epoch):
+        epoch_loss_collector = []
+
+        # Debug print to check the length of the data loader
+        logger.info(f"Length of train_dataloader: {len(train_dataloader)}")
+
         for batch_idx, (x, target) in enumerate(train_dataloader):
-            x, target = x.cuda(), target.cuda()
+            x, target = x.to(device), target.to(device)
+
             optimizer.zero_grad()
             x.requires_grad = False
             target.requires_grad = False
             target = target.long()
 
-            _,_,out = net(x)
-            loss = criterion(out, target)
-            
+            output = net(x)
+            loss = criterion(output, target)
             loss.backward()
             optimizer.step()
             epoch_loss_collector.append(loss.item())
+
+            # Add debugging information
+            logger.info(f"Epoch: {epoch}, Batch: {batch_idx}, Loss: {loss.item()}")
+            if batch_idx % 10 == 0:  # Print every 10 batches
+                for name, param in net.named_parameters():
+                    if param.requires_grad:
+                        logger.info(f"Parameter: {name}, Gradient Norm: {param.grad.norm().item()}")
+
         epoch_loss = sum(epoch_loss_collector) / len(epoch_loss_collector)
         logger.info('Epoch: %d Loss: %f' % (epoch, epoch_loss))
 
+    # Update the step attribute
+    net.step = n_epoch
+
     test_acc, conf_matrix, _ = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
-    logger.info('>> Test accuracy: %f' % test_acc)
     net.to('cpu')
     return test_acc
 
@@ -48,8 +64,7 @@ def train_net_scaffold(net_id, net, global_model, c_local, c_global, train_datal
     if args_optimizer == 'adam':
         optimizer = optim.Adam(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, weight_decay=args.reg)
     elif args_optimizer == 'amsgrad':
-        optimizer = optim.Adam(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, weight_decay=args.reg,
-                               amsgrad=True)
+        optimizer = optim.Adam(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, weight_decay=args.reg, amsgrad=True)
     elif args_optimizer == 'sgd':
         optimizer = optim.SGD(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, momentum=0.9, weight_decay=args.reg)
     criterion = nn.CrossEntropyLoss().cuda()
@@ -60,6 +75,10 @@ def train_net_scaffold(net_id, net, global_model, c_local, c_global, train_datal
 
     for epoch in range(epochs):
         epoch_loss_collector = []
+
+        # Debug print to check the length of the data loader
+        logger.info(f"Length of train_dataloader: {len(train_dataloader)}")
+
         for batch_idx, (x, target) in enumerate(train_dataloader):
             x, target = x.cuda(), target.cuda()
             optimizer.zero_grad()
@@ -80,7 +99,16 @@ def train_net_scaffold(net_id, net, global_model, c_local, c_global, train_datal
             cnt += 1
             epoch_loss_collector.append(loss.item())
 
-        epoch_loss = sum(epoch_loss_collector) / len(epoch_loss_collector)
+            # Debug print to check the loss value
+            logger.info(f"Batch {batch_idx}, Loss: {loss.item()}")
+
+        # Check if epoch_loss_collector is empty
+        if len(epoch_loss_collector) == 0:
+            logger.error("epoch_loss_collector is empty!")
+            epoch_loss = 0.0
+        else:
+            epoch_loss = sum(epoch_loss_collector) / len(epoch_loss_collector)
+
         logger.info('Epoch: %d Loss: %f' % (epoch, epoch_loss))
 
     c_new_para = c_local.state_dict()
@@ -96,34 +124,36 @@ def train_net_scaffold(net_id, net, global_model, c_local, c_global, train_datal
     logger.info('>> Test accuracy: %f' % test_acc)
     return test_acc, c_delta_para
 
-def train_net_fedprox(net_id, net, global_net, train_dataloader, test_dataloader, epochs, lr, args_optimizer, mu, args,
-                      device="cpu", logger=None):
+def train_net_fedprox(net_id, net, global_net, train_dataloader, test_dataloader, epochs, lr, args_optimizer, mu, args, device="cpu", logger=None):
     logger.info('Training network %s' % str(net_id))
-    net.cuda()
+    net.to(device)
+
     if args_optimizer == 'adam':
         optimizer = optim.Adam(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, weight_decay=args.reg)
     elif args_optimizer == 'amsgrad':
-        optimizer = optim.Adam(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, weight_decay=args.reg,
-                               amsgrad=True)
+        optimizer = optim.Adam(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, weight_decay=args.reg, amsgrad=True)
     elif args_optimizer == 'sgd':
-        optimizer = optim.SGD(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, momentum=0.9,
-                              weight_decay=args.reg)
+        optimizer = optim.SGD(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, momentum=0.9, weight_decay=args.reg)
 
-    criterion = nn.CrossEntropyLoss().cuda()
+    criterion = nn.CrossEntropyLoss().to(device)
 
-    global_weight_collector = list(global_net.cuda().parameters())
+    global_weight_collector = list(global_net.to(device).parameters())
 
     for epoch in range(epochs):
         epoch_loss_collector = []
+
+        # Debug print to check the length of the data loader
+        logger.info(f"Length of train_dataloader: {len(train_dataloader)}")
+
         for batch_idx, (x, target) in enumerate(train_dataloader):
-            x, target = x.cuda(), target.cuda()
+            x, target = x.to(device), target.to(device)
 
             optimizer.zero_grad()
             x.requires_grad = False
             target.requires_grad = False
             target = target.long()
 
-            _,_,out = net(x)
+            _, _, out = net(x)
             loss = criterion(out, target)
 
             # For fedprox
@@ -136,37 +166,48 @@ def train_net_fedprox(net_id, net, global_net, train_dataloader, test_dataloader
             optimizer.step()
 
             epoch_loss_collector.append(loss.item())
-        epoch_loss = sum(epoch_loss_collector) / len(epoch_loss_collector)
+
+            # Debug print to check the loss value
+            logger.info(f"Batch {batch_idx}, Loss: {loss.item()}")
+
+        # Check if epoch_loss_collector is empty
+        if len(epoch_loss_collector) == 0:
+            logger.error("epoch_loss_collector is empty!")
+            epoch_loss = 0.0
+        else:
+            epoch_loss = sum(epoch_loss_collector) / len(epoch_loss_collector)
+
         logger.info('Epoch: %d Loss: %f' % (epoch, epoch_loss))
 
     test_acc, conf_matrix, _ = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
     net.to('cpu')
     return test_acc
 
-def train_net_fedcon(net_id, net, global_net, previous_nets, train_dataloader, test_dataloader, epochs, lr, args_optimizer, mu, temperature, args,
-                      round, device="cpu", logger=None):
+def train_net_fedcon(net_id, net, global_net, previous_nets, train_dataloader, test_dataloader, epochs, lr, args_optimizer, mu, temperature, args, round, device="cpu", logger=None):
     logger.info('Training network %s' % str(net_id))
-    net.cuda()
+    net.to(device)
 
     if args_optimizer == 'adam':
         optimizer = optim.Adam(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, weight_decay=args.reg)
     elif args_optimizer == 'amsgrad':
-        optimizer = optim.Adam(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, weight_decay=args.reg,
-                               amsgrad=True)
+        optimizer = optim.Adam(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, weight_decay=args.reg, amsgrad=True)
     elif args_optimizer == 'sgd':
-        optimizer = optim.SGD(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, momentum=0.9,
-                              weight_decay=args.reg)
+        optimizer = optim.SGD(filter(lambda p: p.requires_grad, net.parameters()), lr=lr, momentum=0.9, weight_decay=args.reg)
 
-    criterion = nn.CrossEntropyLoss().cuda()
+    criterion = nn.CrossEntropyLoss().to(device)
 
     for previous_net in previous_nets:
-        previous_net.cuda()
-    cos=torch.nn.CosineSimilarity(dim=-1)
+        previous_net.to(device)
+    cos = torch.nn.CosineSimilarity(dim=-1)
 
     for epoch in range(epochs):
         epoch_loss_collector = []
+
+        # Debug print to check the length of the data loader
+        logger.info(f"Length of train_dataloader: {len(train_dataloader)}")
+
         for batch_idx, (x, target) in enumerate(train_dataloader):
-            x, target = x.cuda(), target.cuda()
+            x, target = x.to(device), target.to(device)
 
             optimizer.zero_grad()
             x.requires_grad = False
@@ -177,15 +218,15 @@ def train_net_fedcon(net_id, net, global_net, previous_nets, train_dataloader, t
             _, pro2, _ = global_net(x)
 
             posi = cos(pro1, pro2)
-            logits = posi.reshape(-1,1)
+            logits = posi.reshape(-1, 1)
 
             for previous_net in previous_nets:
                 _, pro3, _ = previous_net(x)
                 nega = cos(pro1, pro3)
-                logits = torch.cat((logits, nega.reshape(-1,1)), dim=1)
+                logits = torch.cat((logits, nega.reshape(-1, 1)), dim=1)
 
             logits /= temperature
-            labels = torch.zeros(x.size(0)).cuda().long()
+            labels = torch.zeros(x.size(0)).to(device).long()
 
             loss2 = mu * criterion(logits, labels)
             loss1 = criterion(out, target)
@@ -193,36 +234,47 @@ def train_net_fedcon(net_id, net, global_net, previous_nets, train_dataloader, t
             loss.backward()
             optimizer.step()
             epoch_loss_collector.append(loss.item())
-        epoch_loss = sum(epoch_loss_collector) / len(epoch_loss_collector)
+
+            # Debug print to check the loss value
+            logger.info(f"Batch {batch_idx}, Loss: {loss.item()}")
+
+        # Check if epoch_loss_collector is empty
+        if len(epoch_loss_collector) == 0:
+            logger.error("epoch_loss_collector is empty!")
+            epoch_loss = 0.0
+        else:
+            epoch_loss = sum(epoch_loss_collector) / len(epoch_loss_collector)
+
         logger.info('Epoch: %d Loss: %f' % (epoch, epoch_loss))
+
     for previous_net in previous_nets:
         previous_net.to('cpu')
     test_acc, conf_matrix, _ = compute_accuracy(net, test_dataloader, get_confusion_matrix=True, device=device)
     net.to('cpu')
     return test_acc
-
-def local_train_net(nets, args, net_dataidx_map, train_dl=None, test_dl=None, global_model = None, prev_model_pool = None, round=None, device="cpu", logger=None):
+def local_train_net(nets, args, net_dataidx_map, train_dl=None, test_dl=None, global_model=None, prev_model_pool=None, round=None, device="cpu", logger=None):
     acc_list = []
     if global_model:
-        global_model.cuda()
+        global_model = global_model.to(device)
+
     for net_id, net in nets.items():
         dataidxs = net_dataidx_map[net_id]
-        train_dl_local=train_dl[net_id]   
+        train_dl_local = train_dl[net_id]
         n_epoch = args.epochs
+
         if args.alg == 'fedavg' or args.alg == 'fednova':
-            testacc = train_net(net_id, net, train_dl_local, test_dl, n_epoch, args.lr, args.optimizer, args,
-                                        device=device, logger=logger)
+            testacc = train_net(net_id, net, train_dl_local, test_dl, n_epoch, args.lr, args.optimizer, args, device=device, logger=logger)
         elif args.alg == 'fedprox':
-            testacc = train_net_fedprox(net_id, net, global_model, train_dl_local, test_dl, n_epoch, args.lr,
-                                                  args.optimizer, args.mu, args, device=device, logger=logger)
+            testacc = train_net_fedprox(net_id, net, global_model, train_dl_local, test_dl, n_epoch, args.lr, args.optimizer, args.mu, args, device=device, logger=logger)
         elif args.alg == 'moon':
-            prev_models=[]
+            prev_models = []
             for i in range(len(prev_model_pool)):
                 prev_models.append(prev_model_pool[i][net_id])
-            testacc = train_net_fedcon(net_id, net, global_model, prev_models, train_dl_local, test_dl, n_epoch, args.lr,
-                                                  args.optimizer, args.mu, args.temperature, args, round, device=device, logger=logger)
-        print("Training network %s, n_training: %d, final test acc %f." % (str(net_id), len(dataidxs), testacc))
+            testacc = train_net_fedcon(net_id, net, global_model, prev_models, train_dl_local, test_dl, n_epoch, args.lr, args.optimizer, args.mu, args.temperature, args, round, device=device, logger=logger)
+
+        logger.info("Training network %s, n_training: %d, final test acc %f." % (str(net_id), len(dataidxs), testacc))
         acc_list.append(testacc)
+
     if global_model:
         global_model.to('cpu')
     return acc_list

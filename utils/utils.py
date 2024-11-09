@@ -8,7 +8,7 @@ import torch.utils.data as data
 import torch.nn as nn
 from sklearn.metrics import confusion_matrix
 from utils.model import *
-from utils.datasets import CIFAR10_truncated, CIFAR100_truncated, FashionMNIST_truncated, ImageFolder_CINIC10, ImageFolder_HAM10000
+from utils.datasets import CIFAR10_truncated, CIFAR100_truncated, FashionMNIST_truncated, ImageFolder_CINIC10, ImageFolder_HAM10000,HeartDataset_truncated
 
 logging.basicConfig()
 logger = logging.getLogger()
@@ -21,22 +21,37 @@ def mkdirs(dirpath):
     except Exception as _:
         pass
     
-def init_nets(n_parties, args, device='cpu'):
+def init_nets(n_parties, args, device='cuda'):
     nets = {net_i: None for net_i in range(n_parties)}
-    if args.dataset in {'cifar10', 'fmnist', 'cinic10'}:
-        n_classes = 10
-    elif args.dataset == 'ham10000':
-        n_classes = 7
-    elif args.dataset == 'cifar100':
-        n_classes = 100
     for net_i in range(n_parties):
-        net = ModelFedCon_noheader(args.model, args.out_dim, n_classes, args.dataset)
-        if device == 'cpu':
-            net.to(device)
+        if args.model == 'simple-mlp':
+            net = SimpleMLP(input_dim=13, hidden_dims=[64, 32, 16], output_dim=2)  # Update hidden_dims
+        elif args.model == 'simple-cnn':
+            net = SimpleCNN(input_dim=(16 * 5 * 5), hidden_dims=[120, 84], output_dim=10)
+        elif args.model == 'vgg':
+            net = vgg11()
+        elif args.model == 'resnet':
+            net = ResNet18()
         else:
+            raise NotImplementedError("Model not implemented")
+
+        # Only move to CUDA if device is not 'cpu' and CUDA is available
+        if device != 'cpu' and torch.cuda.is_available():
             net = net.cuda()
+        else:
+            net = net.to(device)  # This will work for CPU
+
         nets[net_i] = net
+
     return nets
+
+def load_heart_data(datadir, download):
+    transform = None  # No transformation needed for tabular data
+    heart_train_ds = HeartDataset_truncated(datadir, train=True, download=download, transform=transform)
+    heart_test_ds = HeartDataset_truncated(datadir, train=False, download=download, transform=transform)
+    X_train, y_train = heart_train_ds.data, heart_train_ds.target
+    X_test, y_test = heart_test_ds.data, heart_test_ds.target
+    return (X_train, y_train, X_test, y_test)
 
 def load_cifar10_data(datadir, download):
     transform = transforms.Compose([transforms.ToTensor()])
@@ -86,30 +101,27 @@ def load_fmnist_data(datadir, download):
 
 def record_net_data_stats(y_train, net_dataidx_map):
     net_cls_counts_dict = {}
-    net_cls_counts_npy = np.array([])
     num_classes = int(y_train.max()) + 1
-
+    
+    # Initialize numpy array with correct shape
+    net_cls_counts_npy = np.zeros((len(net_dataidx_map), num_classes))
+    
     for net_i, dataidx in net_dataidx_map.items():
         unq, unq_cnt = np.unique(y_train[dataidx], return_counts=True)
+        # Store counts in dictionary
         tmp = {unq[i]: unq_cnt[i] for i in range(len(unq))}
         net_cls_counts_dict[net_i] = tmp
-        tmp_npy = np.zeros(num_classes)
+        
+        # Fill the numpy array directly
         for i in range(len(unq)):
-            tmp_npy[unq[i]] = unq_cnt[i]
-        net_cls_counts_npy = np.concatenate(
-                        (net_cls_counts_npy, tmp_npy), axis=0)
-    net_cls_counts_npy = np.reshape(net_cls_counts_npy, (-1,num_classes))
-
-    data_list=[]
-    for net_id, data in net_cls_counts_dict.items():
-        n_total=0
-        for class_id, n_data in data.items():
-            n_total += n_data
-        data_list.append(n_total)
+            net_cls_counts_npy[net_i][unq[i]] = unq_cnt[i]
+    
+    # Calculate and print data distribution
+    data_list = [sum(counts.values()) for counts in net_cls_counts_dict.values()]
     print('Data distribution over clients (each row for a client): ')
     print(net_cls_counts_npy.astype(int), '\n')
+    
     return net_cls_counts_npy
-
 def partition_split_test_data(args):
     dataset, datadir, test_global_imbalanced, download = args.dataset, args.datadir, args.test_imb, args.download_data
     if dataset == 'cifar10':
@@ -160,6 +172,8 @@ def partition_data(args):
         _, y_train, _, _ = load_cinic10_data(datadir, download)
     elif dataset == 'ham10000':
         _, y_train, _, _ = load_HAM10000_data(datadir, download)
+    elif dataset == 'heart':
+        _, y_train, _, _ = load_heart_data(datadir, download)
     n_train = y_train.shape[0]
 
     if partition == "homo" or partition == "iid":
@@ -183,9 +197,9 @@ def partition_data(args):
             for k in range(K):
                 idx_k = np.where(y_train == k)[0]
                 np.random.shuffle(idx_k)
-                if global_imbalanced!=0:   # Global dataset is imbalanced, following an exponential decay
-                    ratio =  global_imbalanced
-                    num_k = int(n_train/n_parties * (ratio ** (-k/(K-1))))
+                if global_imbalanced != 0:   # Global dataset is imbalanced, following an exponential decay
+                    ratio = global_imbalanced
+                    num_k = int(n_train / n_parties * (ratio ** (-k / (K - 1))))
                     idx_k = idx_k[:num_k]
                 proportions = np.random.dirichlet(np.repeat(beta, n_parties))
                 proportions = np.array([p * (len(idx_j) < N / n_parties) for p, idx_j in zip(proportions, idx_batch)])
@@ -197,13 +211,13 @@ def partition_data(args):
             np.random.shuffle(idx_batch[j])
             net_dataidx_map[j] = idx_batch[j]
 
-    elif partition=='noniid-2' and dataset in ['cifar10', 'fmnist', 'cinic10']:
+    elif partition == 'noniid-2' and dataset in ['cifar10', 'fmnist', 'cinic10']:
         labels = y_train
-        num_non_iid_client = n_niid_parties                           
-        num_iid_client =  n_parties-num_non_iid_client
-        num_classes = int(labels.max()+1)
-        num_sample_per_class = n_train//num_classes
-        num_per_shard = int(n_train/num_classes/(num_non_iid_client+num_iid_client))
+        num_non_iid_client = n_niid_parties
+        num_iid_client = n_parties - num_non_iid_client
+        num_classes = int(labels.max() + 1)
+        num_sample_per_class = n_train // num_classes
+        num_per_shard = int(n_train / num_classes / (num_non_iid_client + num_iid_client))
         net_dataidx_map = {i: np.array([]).astype(int) for i in range(n_parties)}
         idxs = np.arange(n_train).astype(int)
 
@@ -215,56 +229,56 @@ def partition_data(args):
         # Partition of non-iid clients
         for i in range(num_non_iid_client):
             net_dataidx_map[i] = np.concatenate(
-                    (net_dataidx_map[i], idxs[((2*i)%10)*num_sample_per_class+num_per_shard*(i//5)*5:((2*i)%10)*num_sample_per_class+num_per_shard*(i//5+1)*5]), axis=0)
+                    (net_dataidx_map[i], idxs[((2 * i) % 10) * num_sample_per_class + num_per_shard * (i // 5) * 5:((2 * i) % 10) * num_sample_per_class + num_per_shard * (i // 5 + 1) * 5]), axis=0)
             net_dataidx_map[i] = np.concatenate(
-                    (net_dataidx_map[i], idxs[((2*i+1)%10)*num_sample_per_class+num_per_shard*(i//5)*5:((2*i+1)%10)*num_sample_per_class+num_per_shard*(i//5+1)*5]), axis=0)
+                    (net_dataidx_map[i], idxs[((2 * i + 1) % 10) * num_sample_per_class + num_per_shard * (i // 5) * 5:((2 * i + 1) % 10) * num_sample_per_class + num_per_shard * (i // 5 + 1) * 5]), axis=0)
             np.random.shuffle(net_dataidx_map[i])
             net_dataidx_map[i] = list(net_dataidx_map[i])
-        
+
         # Partition of iid clients
-        for i in range(num_non_iid_client,n_parties):
+        for i in range(num_non_iid_client, n_parties):
             for j in range(num_classes):
                 net_dataidx_map[i] = np.concatenate(
-                        (net_dataidx_map[i], idxs[j*num_sample_per_class+num_per_shard*5*(num_non_iid_client//5)+num_per_shard*(i-num_non_iid_client): \
-                                                    j*num_sample_per_class+num_per_shard*5*(num_non_iid_client//5)+num_per_shard*(i-num_non_iid_client+1)]), axis=0)
+                        (net_dataidx_map[i], idxs[j * num_sample_per_class + num_per_shard * 5 * (num_non_iid_client // 5) + num_per_shard * (i - num_non_iid_client): \
+                                                    j * num_sample_per_class + num_per_shard * 5 * (num_non_iid_client // 5) + num_per_shard * (i - num_non_iid_client + 1)]), axis=0)
             np.random.shuffle(net_dataidx_map[i])
             net_dataidx_map[i] = list(net_dataidx_map[i])
-    
-    elif partition=='noniid-2' and dataset=='cifar100':
+
+    elif partition == 'noniid-2' and dataset == 'cifar100':
         labels = y_train
-        num_non_iid_client = n_niid_parties                             
-        num_iid_client =  n_parties-num_non_iid_client  
-        num_classes = int(labels.max()+1)
-        num_sample_per_class = n_train//num_classes
-        num_per_shard = int(n_train/num_classes/(num_non_iid_client+num_iid_client))    
+        num_non_iid_client = n_niid_parties
+        num_iid_client = n_parties - num_non_iid_client
+        num_classes = int(labels.max() + 1)
+        num_sample_per_class = n_train // num_classes
+        num_per_shard = int(n_train / num_classes / (num_non_iid_client + num_iid_client))
 
         net_dataidx_map = {i: np.array([]).astype(int) for i in range(n_parties)}
         idxs = np.arange(n_train).astype(int)
 
         # Sort labels
-        idxs_labels = np.vstack((idxs, labels)).astype(int)    
+        idxs_labels = np.vstack((idxs, labels)).astype(int)
         idxs_labels = idxs_labels[:, idxs_labels[1, :].argsort()]
-        idxs = idxs_labels[0, :]           
+        idxs = idxs_labels[0, :]
 
         # Partition of non-iid clients
         for i in range(num_non_iid_client):
             for j in range(20):
                 net_dataidx_map[i] = np.concatenate(
-                        (net_dataidx_map[i], idxs[((20*i+j)%100)*num_sample_per_class+num_per_shard*(i//5)*5:((20*i+j)%100)*num_sample_per_class+num_per_shard*(i//5+1)*5]), axis=0)
-                print(((20*i+j)%100)*num_sample_per_class+num_per_shard*(i//5)*5,((20*i+j)%100)*num_sample_per_class+num_per_shard*(i//5+1)*5)
+                        (net_dataidx_map[i], idxs[((20 * i + j) % 100) * num_sample_per_class + num_per_shard * (i // 5) * 5:((20 * i + j) % 100) * num_sample_per_class + num_per_shard * (i // 5 + 1) * 5]), axis=0)
+                print(((20 * i + j) % 100) * num_sample_per_class + num_per_shard * (i // 5) * 5, ((20 * i + j) % 100) * num_sample_per_class + num_per_shard * (i // 5 + 1) * 5)
             np.random.shuffle(net_dataidx_map[i])
             net_dataidx_map[i] = list(net_dataidx_map[i])
-            
+
         # Partition of iid clients
-        for i in range(num_non_iid_client,n_parties):
+        for i in range(num_non_iid_client, n_parties):
             for j in range(num_classes):
                 net_dataidx_map[i] = np.concatenate(
-                        (net_dataidx_map[i], idxs[j*num_sample_per_class+num_per_shard*5*(num_non_iid_client//5)+num_per_shard*(i-num_non_iid_client): \
-                                                    j*num_sample_per_class+num_per_shard*5*(num_non_iid_client//5)+num_per_shard*(i-num_non_iid_client+1)]), axis=0)
-                print(j*num_sample_per_class+num_per_shard*5*(num_non_iid_client//5)+num_per_shard*(i-num_non_iid_client),j*num_sample_per_class+num_per_shard*5*(num_non_iid_client//5)+num_per_shard*(i-num_non_iid_client+1))
+                        (net_dataidx_map[i], idxs[j * num_sample_per_class + num_per_shard * 5 * (num_non_iid_client // 5) + num_per_shard * (i - num_non_iid_client): \
+                                                    j * num_sample_per_class + num_per_shard * 5 * (num_non_iid_client // 5) + num_per_shard * (i - num_non_iid_client + 1)]), axis=0)
+                print(j * num_sample_per_class + num_per_shard * 5 * (num_non_iid_client // 5) + num_per_shard * (i - num_non_iid_client), j * num_sample_per_class + num_per_shard * 5 * (num_non_iid_client // 5) + num_per_shard * (i - num_non_iid_client + 1))
             np.random.shuffle(net_dataidx_map[i])
             net_dataidx_map[i] = list(net_dataidx_map[i])
-   
+
     traindata_cls_counts = record_net_data_stats(y_train, net_dataidx_map)
     return (net_dataidx_map, traindata_cls_counts)
 
@@ -304,129 +318,161 @@ def compute_accuracy(model, dataloader, get_confusion_matrix=False, device="cpu"
 
     correct, total = 0, 0
     true_labels_list, pred_labels_list = np.array([]), np.array([])
-    if device == 'cpu':
-        criterion = nn.CrossEntropyLoss()
-    elif "cuda" in device.type:
-        criterion = nn.CrossEntropyLoss().cuda()
+
+    # Move model to device if not already
+    model = model.to(device)
+    criterion = nn.CrossEntropyLoss().to(device)
     loss_collector = []
+
     if multiloader:
         for loader in dataloader:
             with torch.no_grad():
                 for batch_idx, (x, target) in enumerate(loader):
-                    if device != 'cpu':
-                        x, target = x.cuda(), target.to(dtype=torch.int64).cuda()
-                    _, _, out = model(x)
-                    if len(target)==1:
-                        out= out.unsqueeze(0)
-                        loss = criterion(out, target)
-                    else:
-                        loss = criterion(out, target)
+                    x, target = x.to(device), target.to(dtype=torch.int64).to(device)
+                    # Modified this line
+                    out = model(x)
+                    if isinstance(out, tuple):
+                        out = out[0]  # Take first output if multiple values are returned
+
+                    if len(target) == 1:
+                        out = out.unsqueeze(0)
+
+                    loss = criterion(out, target)
                     _, pred_label = torch.max(out.data, 1)
                     loss_collector.append(loss.item())
                     total += x.data.size()[0]
                     correct += (pred_label == target.data).sum().item()
 
-                    if device == "cpu":
-                        pred_labels_list = np.append(pred_labels_list, pred_label.numpy())
-                        true_labels_list = np.append(true_labels_list, target.data.numpy())
-                    else:
-                        pred_labels_list = np.append(pred_labels_list, pred_label.cpu().numpy())
-                        true_labels_list = np.append(true_labels_list, target.data.cpu().numpy())
+                    pred_labels_list = np.append(pred_labels_list, pred_label.cpu().numpy())
+                    true_labels_list = np.append(true_labels_list, target.data.cpu().numpy())
+
         avg_loss = sum(loss_collector) / len(loss_collector)
     else:
         with torch.no_grad():
             for batch_idx, (x, target) in enumerate(dataloader):
-                if device != 'cpu':
-                    x, target = x.cuda(), target.to(dtype=torch.int64).cuda()
-                _,_,out = model(x)
+                x, target = x.to(device), target.to(dtype=torch.int64).to(device)
+                # Modified this line
+                out = model(x)
+                if isinstance(out, tuple):
+                    out = out[0]  # Take first output if multiple values are returned
+
                 loss = criterion(out, target)
                 _, pred_label = torch.max(out.data, 1)
                 loss_collector.append(loss.item())
                 total += x.data.size()[0]
                 correct += (pred_label == target.data).sum().item()
-                if device == "cpu":
-                    pred_labels_list = np.append(pred_labels_list, pred_label.numpy())
-                    true_labels_list = np.append(true_labels_list, target.data.numpy())
-                else:
-                    pred_labels_list = np.append(pred_labels_list, pred_label.cpu().numpy())
-                    true_labels_list = np.append(true_labels_list, target.data.cpu().numpy())
+
+                pred_labels_list = np.append(pred_labels_list, pred_label.cpu().numpy())
+                true_labels_list = np.append(true_labels_list, target.data.cpu().numpy())
+
             avg_loss = sum(loss_collector) / len(loss_collector)
 
     if get_confusion_matrix:
         conf_matrix = confusion_matrix(true_labels_list, pred_labels_list)
+
     if was_training:
         model.train()
+
     if get_confusion_matrix:
         return correct / float(total), conf_matrix, avg_loss
+
     return correct / float(total), avg_loss
 
 def get_dataloader_split_test(args, dataidxs, test_bs=32):
     dataset, datadir, download = args.dataset, args.datadir, args.download_data
     if dataset == 'cifar10':
         dl_obj = CIFAR10_truncated
-        transform_test=transforms.Compose(
+        transform_test = transforms.Compose(
             [transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))])
+             transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))])
         test_ds = dl_obj(datadir, dataidxs=dataidxs, train=False, transform=transform_test, download=download)
+
+        # Debug print to check the length of the test dataset
+        print(f"Length of test_ds: {len(test_ds)}")
+
         test_dl = data.DataLoader(dataset=test_ds, batch_size=test_bs, shuffle=False)
     return test_dl
 
+
 def get_dataloader(args, dataidxs=None, test_bs=32):
     dataset, datadir, train_bs, download = args.dataset, args.datadir, args.batch_size, args.download_data
-    if dataset in ('cifar10', 'cifar100'):
+    if dataset == 'heart':
+        dl_obj = HeartDataset_truncated
+        transform_train = None  # No transformation needed for tabular data
+        transform_test = None  # No transformation needed for tabular data
+
+        train_ds = dl_obj(datadir, dataidxs=dataidxs, train=True, transform=transform_train, download=download)
+        test_ds = dl_obj(datadir, train=False, transform=transform_test, download=download)
+
+        # Debug print to check the length of the datasets
+        print(f"Length of train_ds: {len(train_ds)}")
+        print(f"Length of test_ds: {len(test_ds)}")
+
+        train_dl = data.DataLoader(dataset=train_ds, batch_size=train_bs, drop_last=True, shuffle=True)
+        test_dl = data.DataLoader(dataset=test_ds, batch_size=test_bs, shuffle=False)
+    elif dataset in ('cifar10', 'cifar100'):
         if dataset == 'cifar10':
             dl_obj = CIFAR10_truncated
-            transform_train=transforms.Compose([
+            transform_train = transforms.Compose([
                 transforms.ToPILImage(),
                 transforms.RandomCrop(32, padding=4),
                 transforms.RandomHorizontalFlip(),
                 transforms.ToTensor(),
                 transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))])
 
-            transform_test=transforms.Compose(
-            [transforms.ToTensor(),
-             transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))])
+            transform_test = transforms.Compose(
+                [transforms.ToTensor(),
+                 transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))])
 
         elif dataset == 'cifar100':
             dl_obj = CIFAR100_truncated
-
-            normalize = transforms.Normalize(mean=[0.5070751592371323, 0.48654887331495095, 0.4409178433670343],
-                                             std=[0.2673342858792401, 0.2564384629170883, 0.27615047132568404])
             transform_train = transforms.Compose([
                 transforms.RandomCrop(32, padding=4),
                 transforms.RandomHorizontalFlip(),
                 transforms.RandomRotation(15),
                 transforms.ToTensor(),
-                normalize
+                transforms.Normalize(mean=[0.5070751592371323, 0.48654887331495095, 0.4409178433670343],
+                                     std=[0.2673342858792401, 0.2564384629170883, 0.27615047132568404])
             ])
             transform_test = transforms.Compose([
                 transforms.ToTensor(),
-                normalize])
+                transforms.Normalize(mean=[0.5070751592371323, 0.48654887331495095, 0.4409178433670343],
+                                     std=[0.2673342858792401, 0.2564384629170883, 0.27615047132568404])
+            ])
+
         train_ds = dl_obj(datadir, dataidxs=dataidxs, train=True, transform=transform_train, download=download)
         test_ds = dl_obj(datadir, train=False, transform=transform_test, download=download)
+
+        # Debug print to check the length of the datasets
+        print(f"Length of train_ds: {len(train_ds)}")
+        print(f"Length of test_ds: {len(test_ds)}")
+
         train_dl = data.DataLoader(dataset=train_ds, batch_size=train_bs, drop_last=True, shuffle=True)
         test_dl = data.DataLoader(dataset=test_ds, batch_size=test_bs, shuffle=False)
-
     elif dataset == 'cinic10':
         dl_obj = ImageFolder_CINIC10
-        transform_train=transforms.Compose([
+        transform_train = transforms.Compose([
             transforms.RandomCrop(32, padding=4),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize((0.47889522, 0.47227842, 0.43047404), (0.24205776, 0.23828046, 0.25874835))])
 
-        transform_test=transforms.Compose(
-        [transforms.ToTensor(),
-            transforms.Normalize((0.47889522, 0.47227842, 0.43047404), (0.24205776, 0.23828046, 0.25874835))])
-        
-        train_ds = dl_obj(datadir+'/train/', dataidxs=dataidxs, transform=transform_train)
-        test_ds = dl_obj(datadir+'/sampled test/', transform=transform_test)
+        transform_test = transforms.Compose(
+            [transforms.ToTensor(),
+             transforms.Normalize((0.47889522, 0.47227842, 0.43047404), (0.24205776, 0.23828046, 0.25874835))])
+
+        train_ds = dl_obj(datadir + '/train/', dataidxs=dataidxs, transform=transform_train)
+        test_ds = dl_obj(datadir + '/sampled test/', transform=transform_test)
+
+        # Debug print to check the length of the datasets
+        print(f"Length of train_ds: {len(train_ds)}")
+        print(f"Length of test_ds: {len(test_ds)}")
+
         train_dl = data.DataLoader(dataset=train_ds, batch_size=train_bs, drop_last=True, shuffle=True)
         test_dl = data.DataLoader(dataset=test_ds, batch_size=test_bs, shuffle=False)
-
     elif dataset == 'ham10000':
         dl_obj = ImageFolder_HAM10000
-        transform_train=transforms.Compose([
+        transform_train = transforms.Compose([
             transforms.Resize((56, 56)),
             transforms.RandomHorizontalFlip(),
             transforms.RandomVerticalFlip(),
@@ -434,16 +480,20 @@ def get_dataloader(args, dataidxs=None, test_bs=32):
             transforms.ColorJitter(brightness=0.1, contrast=0.1, hue=0.1),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
-        transform_test=transforms.Compose([
+        transform_test = transforms.Compose([
             transforms.Resize((56, 56)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
-        
-        train_ds = dl_obj(datadir+'/train_new/', dataidxs=dataidxs, transform=transform_train)
-        test_ds = dl_obj(datadir+'/val_new/', transform=transform_test)
+
+        train_ds = dl_obj(datadir + '/train_new/', dataidxs=dataidxs, transform=transform_train)
+        test_ds = dl_obj(datadir + '/val_new/', transform=transform_test)
+
+        # Debug print to check the length of the datasets
+        print(f"Length of train_ds: {len(train_ds)}")
+        print(f"Length of test_ds: {len(test_ds)}")
+
         train_dl = data.DataLoader(dataset=train_ds, batch_size=train_bs, drop_last=True, shuffle=True)
         test_dl = data.DataLoader(dataset=test_ds, batch_size=test_bs, shuffle=False)
-
     elif dataset == 'fmnist':
         transform_train = transforms.Compose([
             transforms.ToTensor(),
@@ -455,6 +505,11 @@ def get_dataloader(args, dataidxs=None, test_bs=32):
         ])
         train_ds = FashionMNIST_truncated(datadir, dataidxs=dataidxs, train=True, transform=transform_train, download=download)
         test_ds = FashionMNIST_truncated(datadir, train=False, transform=transform_test, download=download)
+
+        # Debug print to check the length of the datasets
+        print(f"Length of train_ds: {len(train_ds)}")
+        print(f"Length of test_ds: {len(test_ds)}")
+
         train_dl = data.DataLoader(dataset=train_ds, batch_size=train_bs, drop_last=True, shuffle=True)
         test_dl = data.DataLoader(dataset=test_ds, batch_size=test_bs, shuffle=False)
 
